@@ -1,0 +1,27 @@
+[package]
+name = "epub-princeznoid"
+version = "0.1.0"
+edition = "2021"
+description = "Rust/Wry hot-reloading EPUB previewer for reflowable InDesign exports."
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+notify = "8.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wry = "=0.24.12"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.15"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = "0.17"
+
+[package.metadata.bundle]
+name = "Princeznoid EPUB Preview"
+identifier = "cz.princeznoid.epubpreview"
+category = "public.app-category.productivity"
+short_description = "Hot-reloading EPUB previewer"
+long_description = "Desktop EPUB previewer that watches a reflowable EPUB export and reloads it in place."

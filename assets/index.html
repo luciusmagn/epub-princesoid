@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Princeznoid EPUB Preview</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">P</span>
+          <div>
+            <h1>Princeznoid</h1>
+            <p id="file-label">No EPUB open</p>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button id="open-button" class="primary">Open</button>
+          <button id="prev-button" disabled>Prev</button>
+          <button id="next-button" disabled>Next</button>
+          <button id="reload-button" disabled>Reload</button>
+          <select id="reader-preset" title="Reader preset">
+            <option value="fluid">Fluid</option>
+            <option value="kindle-paperwhite">Kindle Paperwhite</option>
+            <option value="kindle-oasis">Kindle Oasis</option>
+            <option value="kobo-clara">Kobo Clara</option>
+            <option value="kobo-libra">Kobo Libra</option>
+            <option value="apple-books-phone">Apple Books Phone</option>
+            <option value="apple-books-ipad">Apple Books iPad</option>
+            <option value="boox-palma">BOOX Palma</option>
+            <option value="boox-go-6">BOOX Go 6</option>
+            <option value="boox-go-7">BOOX Go/Color 7</option>
+            <option value="boox-go-103">BOOX Go 10.3</option>
+            <option value="boox-note-air">BOOX Note Air</option>
+          </select>
+          <label>
+            Type
+            <input id="font-size" type="range" min="80" max="170" step="5" value="100" />
+          </label>
+          <label class="range-control">
+            Margin
+            <input id="page-margin" type="range" min="0" max="96" step="2" value="36" />
+            <output id="page-margin-value">36px</output>
+          </label>
+          <select id="spread-mode" title="Spread mode">
+            <option value="none">Single</option>
+            <option value="auto">Auto</option>
+            <option value="always">Spread</option>
+          </select>
+          <select id="theme-mode" title="Theme">
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+      </header>
+
+      <aside class="sidebar">
+        <section>
+          <h2>File</h2>
+          <dl>
+            <div>
+              <dt>Name</dt>
+              <dd id="file-name">-</dd>
+            </div>
+            <div>
+              <dt>Size</dt>
+              <dd id="file-size">-</dd>
+            </div>
+            <div>
+              <dt>Status</dt>
+              <dd id="reload-state">Waiting</dd>
+            </div>
+          </dl>
+        </section>
+        <section>
+          <div class="section-row">
+            <h2>Progress</h2>
+            <span id="progress-text">0%</span>
+          </div>
+          <div class="progress-track"><div id="progress-bar"></div></div>
+        </section>
+        <section class="toc-section">
+          <h2>Contents</h2>
+          <nav id="toc-list"><p class="muted">Open an EPUB.</p></nav>
+        </section>
+      </aside>
+
+      <main class="reader-shell">
+        <div id="drop-layer">Drop EPUB</div>
+        <div id="empty-state">
+          <div>
+            <div class="empty-mark">EPUB</div>
+            <h2>Open an EPUB</h2>
+            <button id="empty-open-button" class="primary">Open file</button>
+          </div>
+        </div>
+        <div id="viewer"></div>
+      </main>
+
+      <div id="toast" role="status" aria-live="polite"></div>
+    </div>
+    <script src="/vendor/jszip.min.js"></script>
+    <script src="/vendor/epub.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
