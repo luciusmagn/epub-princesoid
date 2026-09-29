@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
+mod pdf;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fs::{self, File},
     io,
     path::{Component, Path, PathBuf},
@@ -26,6 +28,7 @@ use wry::{
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
+const PDF_UI_JS: &str = include_str!("../assets/pdf-ui.js");
 const STYLES_CSS: &str = include_str!("../assets/styles.css");
 const JSZIP_JS: &[u8] = include_bytes!("../assets/vendor/jszip.min.js");
 const EPUB_JS: &[u8] = include_bytes!("../assets/vendor/epub.min.js");
@@ -33,11 +36,16 @@ static UNPACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 enum UserEvent {
+    RendererReady,
     OpenDialog,
     OpenFile(PathBuf),
     FileChanged,
     DropVisible(bool),
     NativeError(String),
+    ReloadCurrent,
+    ScanPdf(String, Vec<String>),
+    PdfScanReady(u64, u64, pdf::ScanReport),
+    PdfScanFailed(u64, u64, String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +53,8 @@ struct IpcMessage {
     command: String,
     level: Option<String>,
     message: Option<String>,
+    language: Option<String>,
+    accepted_words: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,24 +68,52 @@ struct OpenPayload {
 #[derive(Clone, Debug)]
 struct OpenBook {
     path: PathBuf,
-    root: PathBuf,
+    revision: u64,
+    root: Option<PathBuf>,
+    pdf_meta: Option<pdf::PdfMeta>,
+    page_cache: HashMap<usize, Vec<u8>>,
 }
 
 type SharedBook = Arc<Mutex<Option<OpenBook>>>;
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--pdf-meta") {
+        let path = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: --pdf-meta FILE"))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&pdf::metadata(Path::new(path))?)?
+        );
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "--check-pdf") {
+        let path = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: --check-pdf FILE [en|cs|es|de|auto]"))?;
+        let path = Path::new(path);
+        let meta = pdf::metadata(path)?;
+        let report = pdf::scan(
+            path,
+            &meta,
+            args.get(2).map(String::as_str).unwrap_or("auto"),
+            &[],
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let event_loop = EventLoop::<UserEvent>::with_user_event();
     let proxy = event_loop.create_proxy();
     let current_book: SharedBook = Arc::new(Mutex::new(None));
-    let initial_path = std::env::args().skip(1).find_map(|arg| {
+    let scan_ticket = Arc::new(AtomicU64::new(0));
+    let initial_path = args.into_iter().find_map(|arg| {
         let path = PathBuf::from(arg);
-        path.extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
-            .then_some(path)
+        is_document_path(&path).then_some(path)
     });
 
     let window = WindowBuilder::new()
-        .with_title("Princeznoid EPUB Preview")
+        .with_title("Princeznoid Proof")
         .with_inner_size(LogicalSize::new(1320.0, 860.0))
         .with_min_inner_size(LogicalSize::new(960.0, 640.0))
         .build(&event_loop)
@@ -84,31 +122,34 @@ fn main() -> Result<()> {
     let webview = build_webview(window, proxy.clone(), current_book.clone())?;
     let mut watcher: Option<RecommendedWatcher> = None;
 
-    if let Some(path) = initial_path {
-        open_epub_path(
-            path,
-            &webview,
-            &proxy,
-            &current_book,
-            &mut watcher,
-            "openFromNative",
-            true,
-        );
-    }
+    let mut pending_initial = initial_path;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            Event::UserEvent(UserEvent::RendererReady) => {
+                if let Some(path) = pending_initial.take() {
+                    open_document_path(
+                        path,
+                        &webview,
+                        &proxy,
+                        &current_book,
+                        &mut watcher,
+                        "openFromNative",
+                        true,
+                    );
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => *control_flow = ControlFlow::Exit,
             Event::UserEvent(UserEvent::OpenDialog) => {
                 eprintln!("open dialog requested");
-                if let Some(path) = pick_epub_file() {
+                if let Some(path) = pick_document_file() {
                     eprintln!("open dialog selected {}", path.display());
-                    open_epub_path(
+                    open_document_path(
                         path,
                         &webview,
                         &proxy,
@@ -123,7 +164,7 @@ fn main() -> Result<()> {
             }
             Event::UserEvent(UserEvent::OpenFile(path)) => {
                 eprintln!("open file requested {}", path.display());
-                open_epub_path(
+                open_document_path(
                     path,
                     &webview,
                     &proxy,
@@ -139,7 +180,7 @@ fn main() -> Result<()> {
                     .ok()
                     .and_then(|guard| guard.as_ref().map(|book| book.path.clone()))
                 {
-                    open_epub_path(
+                    open_document_path(
                         path,
                         &webview,
                         &proxy,
@@ -159,6 +200,75 @@ fn main() -> Result<()> {
                     serde_json::to_string(&message).unwrap_or_else(|_| "\"Native error\"".into());
                 let _ =
                     webview.evaluate_script(&format!("window.Princeznoid.showError({escaped});"));
+            }
+            Event::UserEvent(UserEvent::ReloadCurrent) => {
+                if let Some(path) = current_book
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|book| book.path.clone()))
+                {
+                    open_document_path(
+                        path,
+                        &webview,
+                        &proxy,
+                        &current_book,
+                        &mut watcher,
+                        "reloadFromNative",
+                        false,
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::ScanPdf(language, accepted_words)) => {
+                let selected = current_book.lock().ok().and_then(|guard| {
+                    guard.as_ref().and_then(|book| {
+                        book.pdf_meta
+                            .clone()
+                            .map(|meta| (book.path.clone(), meta, book.revision))
+                    })
+                });
+                if let Some((path, meta, revision)) = selected {
+                    let ticket = scan_ticket.fetch_add(1, Ordering::SeqCst) + 1;
+                    let proxy = proxy.clone();
+                    thread::spawn(move || {
+                        match pdf::scan(&path, &meta, &language, &accepted_words) {
+                            Ok(report) => {
+                                let _ = proxy
+                                    .send_event(UserEvent::PdfScanReady(ticket, revision, report));
+                            }
+                            Err(error) => {
+                                let _ = proxy.send_event(UserEvent::PdfScanFailed(
+                                    ticket,
+                                    revision,
+                                    error.to_string(),
+                                ));
+                            }
+                        }
+                    });
+                }
+            }
+            Event::UserEvent(UserEvent::PdfScanReady(ticket, revision, report))
+                if scan_ticket.load(Ordering::SeqCst) == ticket =>
+            {
+                let current = current_book
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|book| book.revision));
+                if current == Some(revision) {
+                    if let Err(error) = eval_json_call(&webview, "pdfScanResult", &report) {
+                        show_native_error(&webview, error);
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::PdfScanFailed(ticket, revision, message))
+                if scan_ticket.load(Ordering::SeqCst) == ticket =>
+            {
+                let current = current_book
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|book| book.revision));
+                if current == Some(revision) {
+                    let _ = eval_json_call(&webview, "pdfScanError", &message);
+                }
             }
             _ => {}
         }
@@ -188,6 +298,9 @@ fn build_webview(
         .with_ipc_handler(move |_window: &Window, request: String| {
             eprintln!("ipc message: {request}");
             match serde_json::from_str::<IpcMessage>(&request) {
+                Ok(message) if message.command == "renderer-ready" => {
+                    let _ = ipc_proxy.send_event(UserEvent::RendererReady);
+                }
                 Ok(message) if message.command == "open-dialog" => {
                     let _ = ipc_proxy.send_event(UserEvent::OpenDialog);
                 }
@@ -195,6 +308,15 @@ fn build_webview(
                     let level = message.level.as_deref().unwrap_or("log");
                     let text = message.message.as_deref().unwrap_or("");
                     eprintln!("renderer {level}: {text}");
+                }
+                Ok(message) if message.command == "scan-pdf" => {
+                    let _ = ipc_proxy.send_event(UserEvent::ScanPdf(
+                        message.language.unwrap_or_else(|| "auto".into()),
+                        message.accepted_words.unwrap_or_default(),
+                    ));
+                }
+                Ok(message) if message.command == "reload-current" => {
+                    let _ = ipc_proxy.send_event(UserEvent::ReloadCurrent);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -209,7 +331,7 @@ fn build_webview(
                 }
                 FileDropEvent::Dropped(paths) => {
                     let _ = drop_proxy.send_event(UserEvent::DropVisible(false));
-                    if let Some(path) = paths.into_iter().find(|path| is_epub_path(path)) {
+                    if let Some(path) = paths.into_iter().find(|path| is_document_path(path)) {
                         let _ = drop_proxy.send_event(UserEvent::OpenFile(path));
                     }
                 }
@@ -223,6 +345,103 @@ fn build_webview(
         .with_url("princeznoid://app/index.html")?;
 
     builder.build().context("failed to build webview")
+}
+
+fn open_document_path(
+    path: PathBuf,
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    current_book: &SharedBook,
+    watcher: &mut Option<RecommendedWatcher>,
+    script_method: &str,
+    refresh_watcher: bool,
+) {
+    if is_pdf_path(&path) {
+        if let Err(error) = open_pdf_path(
+            path,
+            webview,
+            proxy,
+            current_book,
+            watcher,
+            script_method,
+            refresh_watcher,
+        ) {
+            show_native_error(webview, error);
+        }
+    } else {
+        open_epub_path(
+            path,
+            webview,
+            proxy,
+            current_book,
+            watcher,
+            script_method,
+            refresh_watcher,
+        );
+    }
+}
+
+fn open_pdf_path(
+    path: PathBuf,
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    current_book: &SharedBook,
+    watcher: &mut Option<RecommendedWatcher>,
+    script_method: &str,
+    refresh_watcher: bool,
+) -> Result<()> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    if !is_pdf_path(&path) {
+        return Err(anyhow!("not a PDF: {}", path.display()));
+    }
+    eprintln!("opening PDF {}", path.display());
+    let meta = pdf::metadata(&path)?;
+    let stat = fs::metadata(&path)?;
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "proof.pdf".into());
+    let revision = UNPACK_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut guard = current_book
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        *guard = Some(OpenBook {
+            path: path.clone(),
+            revision,
+            root: None,
+            pdf_meta: Some(meta.clone()),
+            page_cache: HashMap::new(),
+        });
+    }
+    if refresh_watcher {
+        *watcher = Some(start_watcher(path.clone(), proxy.clone())?);
+    }
+    #[derive(Serialize)]
+    struct PdfPayload<'a> {
+        kind: &'static str,
+        name: &'a str,
+        path: String,
+        size: u64,
+        pdf: &'a pdf::PdfMeta,
+        revision: u64,
+        accepted_defaults: &'static [&'static str],
+    }
+    let payload = PdfPayload {
+        kind: "pdf",
+        name: &name,
+        path: path.to_string_lossy().into_owned(),
+        size: stat.len(),
+        pdf: &meta,
+        revision,
+        accepted_defaults: pdf::ACCEPTED_WORDS,
+    };
+    webview.window().set_title(&format!("Princeznoid - {name}"));
+    eval_json_call(webview, script_method, &payload)?;
+    eprintln!("sent PDF payload for {name} ({} pages)", meta.page_count);
+    Ok(())
 }
 
 fn open_epub_path(
@@ -275,7 +494,10 @@ fn open_epub_path_inner(
             .map_err(|_| anyhow!("state lock poisoned"))?;
         *guard = Some(OpenBook {
             path: path.clone(),
-            root,
+            revision: 0,
+            root: Some(root),
+            pdf_meta: None,
+            page_cache: HashMap::new(),
         });
     }
 
@@ -300,8 +522,7 @@ fn unpack_epub(path: &Path) -> Result<PathBuf> {
     ));
 
     if root.exists() {
-        fs::remove_dir_all(&root)
-            .with_context(|| format!("failed to clear {}", root.display()))?;
+        fs::remove_dir_all(&root).with_context(|| format!("failed to clear {}", root.display()))?;
     }
     fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
 
@@ -339,7 +560,7 @@ fn unpack_epub(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn pick_epub_file() -> Option<PathBuf> {
+fn pick_document_file() -> Option<PathBuf> {
     use gtk::prelude::*;
 
     if !gtk::is_initialized() {
@@ -350,7 +571,7 @@ fn pick_epub_file() -> Option<PathBuf> {
     }
 
     let dialog = gtk::FileChooserDialog::with_buttons(
-        Some("Open EPUB"),
+        Some("Open PDF or EPUB"),
         None::<&gtk::Window>,
         gtk::FileChooserAction::Open,
         &[
@@ -361,10 +582,13 @@ fn pick_epub_file() -> Option<PathBuf> {
     dialog.set_modal(true);
 
     let filter = gtk::FileFilter::new();
-    filter.set_name(Some("EPUB"));
+    filter.set_name(Some("PDF or EPUB"));
     filter.add_pattern("*.epub");
     filter.add_pattern("*.EPUB");
+    filter.add_pattern("*.pdf");
+    filter.add_pattern("*.PDF");
     filter.add_mime_type("application/epub+zip");
+    filter.add_mime_type("application/pdf");
     dialog.add_filter(&filter);
 
     let selected = if dialog.run() == gtk::ResponseType::Accept {
@@ -378,10 +602,10 @@ fn pick_epub_file() -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pick_epub_file() -> Option<PathBuf> {
+fn pick_document_file() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("EPUB", &["epub"])
-        .set_title("Open EPUB")
+        .add_filter("PDF or EPUB", &["pdf", "epub"])
+        .set_title("Open PDF or EPUB")
         .pick_file()
 }
 
@@ -494,8 +718,14 @@ fn protocol_response(
             bytes_response("text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec())
         }
         "/app.js" => bytes_response("text/javascript; charset=utf-8", APP_JS.as_bytes().to_vec()),
+        "/pdf-ui.js" => bytes_response(
+            "text/javascript; charset=utf-8",
+            PDF_UI_JS.as_bytes().to_vec(),
+        ),
         "/styles.css" => bytes_response("text/css; charset=utf-8", STYLES_CSS.as_bytes().to_vec()),
-        "/vendor/jszip.min.js" => bytes_response("text/javascript; charset=utf-8", JSZIP_JS.to_vec()),
+        "/vendor/jszip.min.js" => {
+            bytes_response("text/javascript; charset=utf-8", JSZIP_JS.to_vec())
+        }
         "/vendor/epub.min.js" => bytes_response("text/javascript; charset=utf-8", EPUB_JS.to_vec()),
         "/book.epub" => {
             let path = current_book
@@ -508,9 +738,80 @@ fn protocol_response(
                 fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
             bytes_response("application/epub+zip", bytes)
         }
+        _ if path.starts_with("/pdf-page/") => pdf_page_response(path, current_book),
+        _ if path.starts_with("/pdf-chars/") => pdf_character_response(path, current_book),
         _ if path.starts_with("/book/") => book_resource_response(path, current_book),
         _ => Ok(error_response(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+fn pdf_page_response(
+    request_path: &str,
+    current_book: SharedBook,
+) -> Result<Response<Cow<'static, [u8]>>> {
+    let page = request_path
+        .strip_prefix("/pdf-page/")
+        .and_then(|value| value.strip_suffix(".png"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| anyhow!("invalid PDF page path"))?;
+    let (source, cached) = {
+        let guard = current_book
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        let book = guard.as_ref().ok_or_else(|| anyhow!("no PDF is open"))?;
+        let meta = book
+            .pdf_meta
+            .as_ref()
+            .ok_or_else(|| anyhow!("no PDF is open"))?;
+        if page == 0 || page > meta.page_count {
+            return Ok(error_response(StatusCode::NOT_FOUND, "page not found"));
+        }
+        (book.path.clone(), book.page_cache.get(&page).cloned())
+    };
+    let bytes = match cached {
+        Some(bytes) => bytes,
+        None => pdf::render_page(&source, page)?,
+    };
+    if let Ok(mut guard) = current_book.lock() {
+        if let Some(book) = guard.as_mut().filter(|book| book.path == source) {
+            if book.page_cache.len() >= 6 {
+                if let Some(old) = book.page_cache.keys().next().copied() {
+                    book.page_cache.remove(&old);
+                }
+            }
+            book.page_cache.insert(page, bytes.clone());
+        }
+    }
+    bytes_response("image/png", bytes)
+}
+
+fn pdf_character_response(
+    request_path: &str,
+    current_book: SharedBook,
+) -> Result<Response<Cow<'static, [u8]>>> {
+    let page = request_path
+        .strip_prefix("/pdf-chars/")
+        .and_then(|value| value.strip_suffix(".json"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| anyhow!("invalid PDF character path"))?;
+    let path = {
+        let guard = current_book
+            .lock()
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        let book = guard.as_ref().ok_or_else(|| anyhow!("no PDF is open"))?;
+        let meta = book
+            .pdf_meta
+            .as_ref()
+            .ok_or_else(|| anyhow!("no PDF is open"))?;
+        if page == 0 || page > meta.page_count {
+            return Ok(error_response(StatusCode::NOT_FOUND, "page not found"));
+        }
+        book.path.clone()
+    };
+    bytes_response(
+        "application/json; charset=utf-8",
+        pdf::character_page(&path, page)?,
+    )
 }
 
 fn book_resource_response(
@@ -522,7 +823,7 @@ fn book_resource_response(
         .lock()
         .map_err(|_| anyhow!("state lock poisoned"))?
         .as_ref()
-        .map(|book| book.root.clone())
+        .and_then(|book| book.root.clone())
         .ok_or_else(|| anyhow!("no EPUB is open"))?;
     let path = root.join(relative);
 
@@ -646,4 +947,13 @@ fn show_native_error(webview: &WebView, error: anyhow::Error) {
 fn is_epub_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+}
+
+fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+fn is_document_path(path: &Path) -> bool {
+    is_epub_path(path) || is_pdf_path(path)
 }

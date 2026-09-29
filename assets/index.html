@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Princeznoid EPUB Preview</title>
+    <title>Princeznoid Proof</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -13,7 +13,7 @@
           <span class="brand-mark">P</span>
           <div>
             <h1>Princeznoid</h1>
-            <p id="file-label">No EPUB open</p>
+            <p id="file-label">No document open</p>
           </div>
         </div>
         <div class="toolbar">
@@ -21,6 +21,18 @@
           <button id="prev-button" disabled>Prev</button>
           <button id="next-button" disabled>Next</button>
           <button id="reload-button" disabled>Reload</button>
+          <div id="pdf-controls" class="pdf-only">
+            <label class="pdf-page-control">Page <input id="pdf-page-input" type="number" min="1" value="1" aria-label="PDF page" /><span id="pdf-page-total">/ 0</span></label>
+            <select id="pdf-language" title="Proofing language" aria-label="Proofing language">
+              <option value="auto">Auto language</option>
+              <option value="en">English</option>
+              <option value="cs">Czech</option>
+              <option value="es">Spanish</option>
+              <option value="de">German</option>
+            </select>
+            <button id="pdf-run-checks" title="Run checks again">Check</button>
+          </div>
+          <div id="epub-controls">
           <select id="reader-preset" title="Reader preset">
             <option value="fluid">Fluid</option>
             <option value="kindle-paperwhite">Kindle Paperwhite</option>
@@ -49,6 +61,7 @@
             <option value="auto">Auto</option>
             <option value="always">Spread</option>
           </select>
+          </div>
           <select id="theme-mode" title="Theme">
             <option value="light">Light</option>
             <option value="dark">Dark</option>
@@ -74,35 +87,82 @@
             </div>
           </dl>
         </section>
-        <section>
+        <section class="epub-only">
           <div class="section-row">
             <h2>Progress</h2>
             <span id="progress-text">0%</span>
           </div>
           <div class="progress-track"><div id="progress-bar"></div></div>
         </section>
-        <section class="toc-section">
+        <section class="toc-section epub-only">
           <h2>Contents</h2>
           <nav id="toc-list"><p class="muted">Open an EPUB.</p></nav>
+        </section>
+        <section id="pdf-findings" class="pdf-only">
+          <div class="section-row">
+            <h2>Findings</h2>
+            <div id="pdf-issue-nav">
+              <button id="pdf-words-open" type="button" title="Allowed words">Words</button>
+              <span id="pdf-count">0</span>
+              <button id="pdf-prev-issue" type="button" title="Previous finding" aria-label="Previous finding" disabled>↑</button>
+              <button id="pdf-next-issue" type="button" title="Next finding" aria-label="Next finding" disabled>↓</button>
+            </div>
+          </div>
+          <p id="pdf-scan-status" class="muted">Open a PDF.</p>
+          <select id="pdf-filter" aria-label="Filter findings">
+            <option value="all">All checks</option>
+            <option value="coverage">Text coverage</option>
+            <option value="image">Image resolution</option>
+            <option value="toc">Contents</option>
+            <option value="hyphenation">Word breaks</option>
+            <option value="dash">Dashes</option>
+            <option value="quote">Quotation marks</option>
+            <option value="spacing">Double spaces</option>
+            <option value="spelling">Spelling</option>
+            <option value="language">Language</option>
+            <option value="widow">Widows / orphans</option>
+          </select>
+          <div id="pdf-issue-list" role="list"></div>
         </section>
       </aside>
 
       <main class="reader-shell">
-        <div id="drop-layer">Drop EPUB</div>
+        <div id="drop-layer">Drop PDF or EPUB</div>
         <div id="empty-state">
           <div>
-            <div class="empty-mark">EPUB</div>
-            <h2>Open an EPUB</h2>
+            <div class="empty-mark">P</div>
+            <h2>Open a PDF or EPUB</h2>
             <button id="empty-open-button" class="primary">Open file</button>
           </div>
         </div>
         <div id="viewer"></div>
+        <div id="pdf-page-shell" class="pdf-only" tabindex="0">
+          <div id="pdf-stage">
+            <img id="pdf-page-image" alt="PDF page" />
+            <div id="pdf-overlays"></div>
+          </div>
+          <div id="pdf-page-caption"></div>
+        </div>
       </main>
 
       <div id="toast" role="status" aria-live="polite"></div>
     </div>
+    <dialog id="pdf-words-dialog" aria-labelledby="pdf-words-title">
+      <div id="pdf-words-header">
+        <h2 id="pdf-words-title">Allowed words</h2>
+        <span id="pdf-word-count">0</span>
+        <button id="pdf-words-close" type="button" title="Close" aria-label="Close">×</button>
+      </div>
+      <form id="pdf-word-form">
+        <input id="pdf-word-input" type="text" placeholder="Add word" aria-label="Word to allow" autocomplete="off" spellcheck="false" />
+        <button type="submit" title="Add allowed word" aria-label="Add allowed word">+</button>
+      </form>
+      <input id="pdf-word-search" type="search" placeholder="Search words" aria-label="Search allowed words" autocomplete="off" />
+      <div id="pdf-word-list" role="list"></div>
+    </dialog>
     <script src="/vendor/jszip.min.js"></script>
     <script src="/vendor/epub.min.js"></script>
     <script src="/app.js"></script>
+    <script src="/pdf-ui.js"></script>
   </body>
 </html>

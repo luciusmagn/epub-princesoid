@@ -82,10 +82,18 @@ saveSettings();
 
 window.Princeznoid = {
   openFromNative(payload) {
-    openPayload(payload, { reason: "open" });
+    if (payload?.kind === "pdf") window.PdfProof?.open(payload, { reason: "open" });
+    else openPayload(payload, { reason: "open" });
   },
   reloadFromNative(payload) {
-    openPayload({ ...state.payload, ...payload }, { reason: "watch", targetCfi: state.currentCfi });
+    if (payload?.kind === "pdf") window.PdfProof?.open(payload, { reason: "watch" });
+    else openPayload({ ...state.payload, ...payload }, { reason: "watch", targetCfi: state.currentCfi });
+  },
+  pdfScanResult(report) {
+    window.PdfProof?.showReport(report);
+  },
+  pdfScanError(message) {
+    window.PdfProof?.showScanError(message);
   },
   setDropVisible(visible) {
     els.dropLayer.classList.toggle("visible", Boolean(visible));
@@ -101,6 +109,10 @@ function wireUi() {
   els.prevButton.addEventListener("click", () => turnPage("prev"));
   els.nextButton.addEventListener("click", () => turnPage("next"));
   els.reloadButton.addEventListener("click", () => {
+    if (document.body.dataset.document === "pdf") {
+      window.ipc.postMessage(JSON.stringify({ command: "reload-current" }));
+      return;
+    }
     if (state.payload) {
       openPayload(state.payload, { reason: "manual", targetCfi: state.currentCfi });
     }
@@ -151,8 +163,7 @@ function wireUi() {
 }
 
 function handleReaderKeydown(event) {
-  const tag = event.target?.tagName?.toLowerCase();
-  if (tag === "input" || tag === "select" || tag === "textarea") return;
+  if (event.target?.closest?.('button, a, input, select, textarea, [role="listitem"], [contenteditable="true"]')) return;
 
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") {
     event.preventDefault();
@@ -229,6 +240,10 @@ function handleReaderTouchEnd(event) {
 }
 
 function adjustFontSize(delta) {
+  if (document.body.dataset.document === "pdf") {
+    window.PdfProof?.adjustZoom(delta > 0 ? 0.1 : -0.1);
+    return;
+  }
   const min = Number(els.fontSize.min) || 80;
   const max = Number(els.fontSize.max) || 170;
   const next = Math.max(min, Math.min(max, state.settings.fontSize + delta));
@@ -239,6 +254,10 @@ function adjustFontSize(delta) {
 }
 
 async function turnPage(direction) {
+  if (document.body.dataset.document === "pdf") {
+    window.PdfProof?.turn(direction);
+    return;
+  }
   if (!state.rendition || state.turning) return;
   state.turning = true;
   try {
@@ -293,6 +312,8 @@ async function openPayload(payload, options = {}) {
   if (!payload?.url || state.opening) return;
 
   state.opening = true;
+  window.PdfProof?.close();
+  document.body.dataset.document = "epub";
   document.body.classList.add("busy");
   els.reloadState.textContent = options.reason === "watch" ? "Reloading" : "Opening";
 
