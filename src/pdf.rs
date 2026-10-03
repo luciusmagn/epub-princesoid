@@ -470,9 +470,9 @@ fn page_size(doc: &Document, id: ObjectId) -> PageSize {
     }
 }
 
-pub fn render_page(path: &Path, page: usize) -> Result<Vec<u8>> {
+pub fn render_page(path: &Path, page: usize, dpi: u16) -> Result<Vec<u8>> {
     let output = Command::new("mutool")
-        .args(["draw", "-q", "-F", "png", "-r", "144", "-o", "-"])
+        .args(["draw", "-q", "-F", "png", "-r", &dpi.to_string(), "-o", "-"])
         .arg(path)
         .arg(page.to_string())
         .output()

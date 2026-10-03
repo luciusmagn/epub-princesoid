@@ -4,6 +4,12 @@ const pdfEls = {
   pageTotal: document.querySelector("#pdf-page-total"),
   language: document.querySelector("#pdf-language"),
   runChecks: document.querySelector("#pdf-run-checks"),
+  undo: document.querySelector("#pdf-undo"),
+  wordUndo: document.querySelector("#pdf-words-undo"),
+  zoom: document.querySelector("#pdf-zoom"),
+  zoomCustom: document.querySelector("#pdf-zoom-custom"),
+  zoomIn: document.querySelector("#pdf-zoom-in"),
+  zoomOut: document.querySelector("#pdf-zoom-out"),
   status: document.querySelector("#pdf-scan-status"),
   count: document.querySelector("#pdf-count"),
   prevIssue: document.querySelector("#pdf-prev-issue"),
@@ -29,11 +35,16 @@ const pdfState = {
   payload: null,
   page: 1,
   zoom: 1,
+  zoomMode: "page",
+  renderDpi: 0,
   report: null,
   activeFinding: null,
   visibleFindings: [],
   ignored: new Set(),
   allowedWords: readAllowedWords(),
+  reviewHistory: [],
+  restoredFinding: null,
+  scanGeneration: 0,
   characterPages: new Map(),
   focusRect: null,
   focusZoomRestore: null,
@@ -42,6 +53,8 @@ const pdfState = {
 };
 
 const PDF_LANGUAGES = { en: "English", cs: "Czech", es: "Spanish", de: "German" };
+const PDF_CSS_SCALE = 96 / 72;
+const PDF_ZOOM_PRESETS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 const PDF_CATEGORIES = {
   coverage: "Text coverage", image: "Image", toc: "Contents", hyphenation: "Word break", dash: "Dash",
   quote: "Quotes", spacing: "Spacing", spelling: "Spelling", language: "Language", widow: "Page break"
@@ -64,7 +77,12 @@ pdfEls.language.addEventListener("change", () => {
   requestPdfScan();
 });
 pdfEls.runChecks.addEventListener("click", requestPdfScan);
-pdfEls.filter.addEventListener("change", () => { clearFindingFocus(); renderFindings(); });
+pdfEls.undo.addEventListener("click", undoReviewAction);
+pdfEls.wordUndo.addEventListener("click", undoReviewAction);
+pdfEls.zoomIn.addEventListener("click", () => adjustPdfZoom(0.1));
+pdfEls.zoomOut.addEventListener("click", () => adjustPdfZoom(-0.1));
+pdfEls.zoom.addEventListener("change", () => setPdfZoom(pdfEls.zoom.value));
+pdfEls.filter.addEventListener("change", () => { pdfState.restoredFinding = null; clearFindingFocus(); renderFindings(); });
 pdfEls.prevIssue.addEventListener("click", () => navigateFinding(-1));
 pdfEls.nextIssue.addEventListener("click", () => navigateFinding(1));
 pdfEls.wordOpen.addEventListener("click", () => {
@@ -82,24 +100,36 @@ pdfEls.wordForm.addEventListener("submit", (event) => {
 pdfEls.wordInput.addEventListener("input", () => pdfEls.wordInput.setCustomValidity(""));
 pdfEls.image.addEventListener("load", () => {
   renderMarkers();
-  if (pdfState.activeFinding?.rect) centerOnRect(pdfState.focusRect || pdfState.activeFinding.rect);
+  if (pdfState.focusZoomRestore !== null && pdfState.activeFinding?.rect) centerOnRect(pdfState.focusRect || pdfState.activeFinding.rect);
 });
 pdfEls.image.addEventListener("error", () => {
   pdfEls.caption.textContent = `Could not render PDF page ${pdfState.page}.`;
 });
 pdfEls.shell.addEventListener("wheel", (event) => {
-  if (pdfState.zoom > 1 || event.ctrlKey || Math.abs(event.deltaY) < 15) return;
+  if (event.ctrlKey || event.metaKey) {
+    event.preventDefault();
+    if (event.deltaY) setPdfZoom(pdfState.zoom * Math.exp(-event.deltaY * 0.002), event);
+    return;
+  }
+  if (pdfEls.stage.offsetHeight > pdfEls.shell.clientHeight - 42 || pdfEls.stage.offsetWidth > pdfEls.shell.clientWidth - 24 || Math.abs(event.deltaY) < 15) return;
   event.preventDefault();
   if (Date.now() - pdfState.wheelAt < 250) return;
   pdfState.wheelAt = Date.now();
   turnPdfPage(event.deltaY > 0 ? "next" : "prev");
 }, { passive: false });
+document.addEventListener("keydown", (event) => {
+  if (document.body.dataset.document !== "pdf" || !(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey || event.key.toLowerCase() !== "z") return;
+  if (event.target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+  event.preventDefault();
+  undoReviewAction();
+});
 
 if (window.ResizeObserver) new ResizeObserver(fitPdfPage).observe(pdfEls.shell);
 
 function openPdf(payload, options = {}) {
   const sameFile = pdfState.payload?.path === payload.path;
   const previousPage = sameFile && options.reason === "watch" ? pdfState.page : 1;
+  const previousZoom = sameFile ? { zoom: pdfState.zoom, mode: pdfState.zoomMode } : { zoom: 1, mode: "page" };
   destroyBook();
   state.payload = payload;
   pdfState.payload = payload;
@@ -109,7 +139,12 @@ function openPdf(payload, options = {}) {
   pdfState.focusZoomRestore = null;
   pdfState.focusRequest++;
   pdfState.characterPages.clear();
-  pdfState.zoom = 1;
+  pdfState.zoom = previousZoom.zoom;
+  pdfState.zoomMode = previousZoom.mode;
+  pdfState.renderDpi = 0;
+  pdfState.restoredFinding = null;
+  if (!sameFile) pdfState.reviewHistory = [];
+  updateReviewUndo();
   pdfState.page = Math.min(previousPage, payload.pdf.page_count);
   pdfState.ignored = readIgnored(payload.path);
   document.body.dataset.document = "pdf";
@@ -140,12 +175,16 @@ function closePdf() {
   pdfState.focusRequest++;
   pdfState.characterPages.clear();
   pdfState.visibleFindings = [];
+  pdfState.reviewHistory = [];
+  pdfState.restoredFinding = null;
+  updateReviewUndo();
   pdfEls.image.removeAttribute("src");
   pdfEls.overlays.replaceChildren();
 }
 
 function requestPdfScan() {
   if (!pdfState.payload) return;
+  pdfState.scanGeneration++;
   pdfEls.status.textContent = "Checking pages…";
   pdfEls.runChecks.disabled = true;
   window.ipc.postMessage(JSON.stringify({ command: "scan-pdf", language: pdfEls.language.value, accepted_words: [...pdfState.allowedWords] }));
@@ -159,6 +198,12 @@ function showPdfReport(report) {
   pdfEls.status.textContent = `${PDF_LANGUAGES[report.language] || report.language} · ${pdfState.payload.pdf.page_count} pages checked`;
   renderFindings();
   renderMarkers();
+  if (pdfState.restoredFinding) {
+    const target = pdfState.restoredFinding;
+    pdfState.restoredFinding = null;
+    const finding = report.findings.find((item) => item.page === target.page && findingKey(item) === findingKey(target));
+    if (finding && !findingIsHidden(finding)) focusRestoredFinding(finding);
+  }
 }
 
 function showPdfScanError(message) {
@@ -175,10 +220,10 @@ function goToPage(page, force = false) {
     return;
   }
   pdfState.page = next;
+  pdfState.renderDpi = 0;
   pdfEls.pageInput.value = next;
   pdfEls.overlays.replaceChildren();
   fitPdfPage();
-  pdfEls.image.src = `princeznoid://app/pdf-page/${next}.png?revision=${pdfState.payload.revision}`;
   const label = pdfState.payload.pdf.labels[next - 1] || String(next);
   pdfEls.caption.textContent = label === String(next) ? `Page ${next}` : `Page ${label} · PDF ${next}`;
   pdfEls.shell.scrollTo({ top: 0, left: 0, behavior: "instant" });
@@ -191,27 +236,76 @@ function fitPdfPage() {
   if (!size) return;
   const availableWidth = Math.max(100, pdfEls.shell.clientWidth - 24);
   const availableHeight = Math.max(100, pdfEls.shell.clientHeight - 42);
-  const baseScale = Math.min(availableWidth / size.width, availableHeight / size.height);
-  const scale = baseScale * pdfState.zoom;
+  if (pdfState.zoomMode === "page") pdfState.zoom = Math.min(availableWidth / size.width, availableHeight / size.height) / PDF_CSS_SCALE;
+  else if (pdfState.zoomMode === "width") pdfState.zoom = availableWidth / size.width / PDF_CSS_SCALE;
+  const scale = PDF_CSS_SCALE * pdfState.zoom;
   pdfEls.stage.style.width = `${Math.round(size.width * scale)}px`;
   pdfEls.stage.style.height = `${Math.round(size.height * scale)}px`;
+  updatePdfZoomControls();
+  const requiredDpi = Math.min(432, scale * 72 * Math.min(window.devicePixelRatio || 1, 2));
+  const dpi = [144, 216, 288, 432].find((value) => value >= requiredDpi) || 432;
+  if (dpi > pdfState.renderDpi) {
+    pdfState.renderDpi = dpi;
+    pdfEls.image.src = `princeznoid://app/pdf-page/${pdfState.page}/${dpi}.png?revision=${pdfState.payload.revision}`;
+  }
 }
 
 function turnPdfPage(direction) {
+  pdfState.restoredFinding = null;
   clearFindingFocus();
   goToPage(pdfState.page + (direction === "next" ? 1 : -1));
 }
 
 function navigatePdfPage(page) {
+  pdfState.restoredFinding = null;
   clearFindingFocus();
   goToPage(page);
 }
 
 function adjustPdfZoom(delta) {
+  setPdfZoom(Math.round((pdfState.zoom + delta) * 100) / 100);
+}
+
+function setPdfZoom(value, pointer = null) {
+  if (!pdfState.payload) return;
+  const mode = value === "page" || value === "width" ? value : "custom";
+  const zoom = Number(value);
+  if (mode === "custom" && !Number.isFinite(zoom)) return;
+  const stage = pdfEls.stage.getBoundingClientRect();
+  const shell = pdfEls.shell.getBoundingClientRect();
+  const clientX = pointer?.clientX ?? shell.left + shell.width / 2;
+  const clientY = pointer?.clientY ?? shell.top + shell.height / 2;
+  const anchorX = (clientX - stage.left) / stage.width;
+  const anchorY = (clientY - stage.top) / stage.height;
   pdfState.focusZoomRestore = null;
-  pdfState.zoom = Math.min(2.5, Math.max(0.5, Math.round((pdfState.zoom + delta) * 10) / 10));
+  pdfState.zoomMode = mode;
+  if (mode === "custom") pdfState.zoom = Math.min(3, Math.max(0.25, zoom));
   fitPdfPage();
-  if (pdfState.activeFinding?.rect) centerOnRect(pdfState.focusRect || pdfState.activeFinding.rect);
+  if (mode !== "custom") {
+    pdfEls.shell.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  } else if (!pointer && pdfState.activeFinding?.rect) {
+    centerOnRect(pdfState.focusRect || pdfState.activeFinding.rect);
+  } else {
+    const page = pdfState.page;
+    requestAnimationFrame(() => {
+      if (!pdfState.payload || pdfState.page !== page) return;
+      const resized = pdfEls.stage.getBoundingClientRect();
+      pdfEls.shell.scrollTo({
+        left: pdfEls.shell.scrollLeft + resized.left + anchorX * resized.width - clientX,
+        top: pdfEls.shell.scrollTop + resized.top + anchorY * resized.height - clientY,
+        behavior: "instant"
+      });
+    });
+  }
+}
+
+function updatePdfZoomControls() {
+  const preset = PDF_ZOOM_PRESETS.find((value) => Math.abs(value - pdfState.zoom) < 0.001);
+  pdfEls.zoomCustom.hidden = pdfState.zoomMode !== "custom" || preset !== undefined;
+  pdfEls.zoomCustom.textContent = `${Math.round(pdfState.zoom * 100)}%`;
+  pdfEls.zoom.value = pdfState.zoomMode !== "custom" ? pdfState.zoomMode : preset === undefined ? "custom" : String(preset);
+  pdfEls.zoomIn.disabled = pdfState.zoom >= 3;
+  pdfEls.zoomOut.disabled = pdfState.zoom <= 0.25;
 }
 
 function findingKey(finding) {
@@ -265,12 +359,7 @@ function renderAllowedWords() {
       remove.textContent = "×";
       remove.title = `Remove ${word}`;
       remove.setAttribute("aria-label", `Remove ${word}`);
-      remove.addEventListener("click", () => {
-        pdfState.allowedWords.delete(word);
-        saveAllowedWords();
-        renderAllowedWords();
-        requestPdfScan();
-      });
+      remove.addEventListener("click", () => removeAllowedWord(word));
       row.append(remove);
     }
     fragment.append(row);
@@ -287,6 +376,9 @@ function addAllowedWord(value) {
   }
   pdfEls.wordInput.value = "";
   if (pdfState.payload?.accepted_defaults?.includes(word) || pdfState.allowedWords.has(word)) return;
+  const finding = pdfState.activeFinding?.category === "spelling" && pdfState.activeFinding.locator === word
+    ? pdfState.activeFinding : pdfState.report?.findings.find((item) => item.category === "spelling" && item.locator === word);
+  rememberReviewAction({ type: "word", word, wasAllowed: false, finding });
   pdfState.allowedWords.add(word);
   pdfEls.wordSearch.value = "";
   saveAllowedWords();
@@ -295,6 +387,73 @@ function addAllowedWord(value) {
   renderFindings();
   renderMarkers();
   if (!pdfEls.wordDialog.open) showToast(`${word} allowed.`);
+}
+
+function removeAllowedWord(word) {
+  if (!pdfState.allowedWords.has(word)) return;
+  rememberReviewAction({ type: "word", word, wasAllowed: true });
+  pdfState.allowedWords.delete(word);
+  saveAllowedWords();
+  renderAllowedWords();
+  renderFindings();
+  renderMarkers();
+  requestPdfScan();
+}
+
+function rememberReviewAction(action) {
+  pdfState.restoredFinding = null;
+  pdfState.reviewHistory.push({ ...action, scanGeneration: pdfState.scanGeneration });
+  updateReviewUndo();
+}
+
+function updateReviewUndo() {
+  const action = pdfState.reviewHistory[pdfState.reviewHistory.length - 1];
+  const title = !action ? "Undo last review action" : action.type === "ignore" ? "Undo ignored finding"
+    : `Undo ${action.wasAllowed ? "removing" : "allowing"} ${action.word}`;
+  for (const button of [pdfEls.undo, pdfEls.wordUndo]) {
+    button.disabled = !action;
+    button.title = title;
+    button.setAttribute("aria-label", title);
+  }
+}
+
+function saveIgnored() {
+  try { localStorage.setItem(`princeznoid-ignored:${pdfState.payload.path}`, JSON.stringify([...pdfState.ignored])); }
+  catch { /* no persistence */ }
+}
+
+function undoReviewAction() {
+  const action = pdfState.reviewHistory.pop();
+  if (!action || !pdfState.payload) return;
+  pdfState.restoredFinding = null;
+  if (action.type === "ignore") {
+    pdfState.ignored.delete(action.key);
+    saveIgnored();
+  } else {
+    if (action.wasAllowed) pdfState.allowedWords.add(action.word);
+    else pdfState.allowedWords.delete(action.word);
+    saveAllowedWords();
+    renderAllowedWords();
+  }
+  if (pdfState.activeFinding && findingIsHidden(pdfState.activeFinding)) clearFindingFocus();
+  renderFindings();
+  renderMarkers();
+  updateReviewUndo();
+  if (action.finding) focusRestoredFinding(action.finding);
+  if (action.type === "word" && action.scanGeneration !== pdfState.scanGeneration) {
+    pdfState.restoredFinding = action.wasAllowed ? null : action.finding;
+    requestPdfScan();
+  }
+  if (!pdfEls.wordDialog.open) showToast("Review action undone.");
+}
+
+function focusRestoredFinding(target) {
+  const finding = pdfState.report?.findings.find((item) => item.page === target.page && findingKey(item) === findingKey(target));
+  if (!finding || findingIsHidden(finding)) return;
+  if (pdfEls.filter.value !== "all" && pdfEls.filter.value !== finding.category) pdfEls.filter.value = finding.category;
+  renderFindings();
+  const row = pdfEls.issues.querySelector(`[data-finding-id="${finding.id}"]`);
+  if (row) selectFinding(finding, row);
 }
 
 function findingIsHidden(finding) {
@@ -308,9 +467,11 @@ function readIgnored(path) {
 }
 
 function ignoreFinding(finding) {
-  pdfState.ignored.add(findingKey(finding));
-  try { localStorage.setItem(`princeznoid-ignored:${pdfState.payload.path}`, JSON.stringify([...pdfState.ignored])); }
-  catch { /* no persistence */ }
+  const key = findingKey(finding);
+  if (pdfState.ignored.has(key)) return;
+  rememberReviewAction({ type: "ignore", key, finding });
+  pdfState.ignored.add(key);
+  saveIgnored();
   if (pdfState.activeFinding?.id === finding.id) clearFindingFocus();
   renderFindings();
   renderMarkers();
@@ -415,6 +576,7 @@ function appendFindingExcerpt(element, finding) {
 }
 
 function selectFinding(finding, row) {
+  pdfState.restoredFinding = null;
   pdfEls.issues.querySelector(".pdf-issue.active")?.classList.remove("active");
   pdfState.activeFinding = finding;
   pdfState.focusRect = null;
@@ -424,8 +586,11 @@ function selectFinding(finding, row) {
   updateFindingNavigation();
   goToPage(finding.page);
   if (finding.rect) {
-    if (pdfState.focusZoomRestore === null) pdfState.focusZoomRestore = pdfState.zoom;
-    pdfState.zoom = Math.max(1.8, pdfState.zoom);
+    if (pdfState.focusZoomRestore === null) pdfState.focusZoomRestore = { zoom: pdfState.zoom, mode: pdfState.zoomMode };
+    if (pdfState.zoomMode !== "custom") {
+      pdfState.zoom = Math.min(3, Math.max(1, pdfState.zoom * 1.8));
+      pdfState.zoomMode = "custom";
+    }
     fitPdfPage();
     centerOnRect(finding.rect);
   }
@@ -435,7 +600,7 @@ function selectFinding(finding, row) {
       if (pdfState.focusRequest !== request || pdfState.activeFinding !== finding) return;
       pdfState.focusRect = locateFinding(page, finding);
       renderMarkers();
-      if (pdfState.focusRect) centerOnRect(pdfState.focusRect);
+      if (pdfState.focusRect && pdfState.focusZoomRestore !== null) centerOnRect(pdfState.focusRect);
     }).catch((error) => {
       if (pdfState.focusRequest === request) reportRendererError(error);
     });
@@ -449,7 +614,8 @@ function clearFindingFocus() {
   pdfEls.issues.querySelector(".pdf-issue.active")?.classList.remove("active");
   updateFindingNavigation();
   if (pdfState.focusZoomRestore !== null) {
-    pdfState.zoom = pdfState.focusZoomRestore;
+    pdfState.zoom = pdfState.focusZoomRestore.zoom;
+    pdfState.zoomMode = pdfState.focusZoomRestore.mode;
     pdfState.focusZoomRestore = null;
     fitPdfPage();
   }

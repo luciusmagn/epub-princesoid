@@ -32,6 +32,7 @@ const PDF_UI_JS: &str = include_str!("../assets/pdf-ui.js");
 const STYLES_CSS: &str = include_str!("../assets/styles.css");
 const JSZIP_JS: &[u8] = include_bytes!("../assets/vendor/jszip.min.js");
 const EPUB_JS: &[u8] = include_bytes!("../assets/vendor/epub.min.js");
+const LUCIDE_LICENSE: &str = include_str!("../assets/vendor/lucide-LICENSE");
 static UNPACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -71,7 +72,7 @@ struct OpenBook {
     revision: u64,
     root: Option<PathBuf>,
     pdf_meta: Option<pdf::PdfMeta>,
-    page_cache: HashMap<usize, Vec<u8>>,
+    page_cache: HashMap<(usize, u16), Vec<u8>>,
 }
 
 type SharedBook = Arc<Mutex<Option<OpenBook>>>;
@@ -727,6 +728,10 @@ fn protocol_response(
             bytes_response("text/javascript; charset=utf-8", JSZIP_JS.to_vec())
         }
         "/vendor/epub.min.js" => bytes_response("text/javascript; charset=utf-8", EPUB_JS.to_vec()),
+        "/vendor/lucide-LICENSE" => bytes_response(
+            "text/plain; charset=utf-8",
+            LUCIDE_LICENSE.as_bytes().to_vec(),
+        ),
         "/book.epub" => {
             let path = current_book
                 .lock()
@@ -752,8 +757,16 @@ fn pdf_page_response(
     let page = request_path
         .strip_prefix("/pdf-page/")
         .and_then(|value| value.strip_suffix(".png"))
-        .and_then(|value| value.parse::<usize>().ok())
         .ok_or_else(|| anyhow!("invalid PDF page path"))?;
+    let (page, dpi) = match page.split_once('/') {
+        Some((page, dpi)) => (page, dpi.parse::<u16>().context("invalid PDF resolution")?),
+        None => (page, 144),
+    };
+    if ![144, 216, 288, 432].contains(&dpi) {
+        return Err(anyhow!("unsupported PDF resolution"));
+    }
+    let page = page.parse::<usize>().context("invalid PDF page number")?;
+    let cache_key = (page, dpi);
     let (source, cached) = {
         let guard = current_book
             .lock()
@@ -766,11 +779,11 @@ fn pdf_page_response(
         if page == 0 || page > meta.page_count {
             return Ok(error_response(StatusCode::NOT_FOUND, "page not found"));
         }
-        (book.path.clone(), book.page_cache.get(&page).cloned())
+        (book.path.clone(), book.page_cache.get(&cache_key).cloned())
     };
     let bytes = match cached {
         Some(bytes) => bytes,
-        None => pdf::render_page(&source, page)?,
+        None => pdf::render_page(&source, page, dpi)?,
     };
     if let Ok(mut guard) = current_book.lock() {
         if let Some(book) = guard.as_mut().filter(|book| book.path == source) {
@@ -779,7 +792,7 @@ fn pdf_page_response(
                     book.page_cache.remove(&old);
                 }
             }
-            book.page_cache.insert(page, bytes.clone());
+            book.page_cache.insert(cache_key, bytes.clone());
         }
     }
     bytes_response("image/png", bytes)

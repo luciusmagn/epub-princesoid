@@ -33,6 +33,8 @@ Select a finding to jump to and zoom in on its page; the arrow buttons step thro
 
 Run `cargo test` and `node tools/test_pdf_ui.cjs` for the focused scanner and UI checks.
 
+PDF highlights use a translucent fill without outlines. `Undo` reverses ignored findings and changes to allowed words in the current review session; `Ctrl+Z` / `Cmd+Z` also works outside text fields. The page toolbar has zoom buttons, Fit Page, Fit Width, and percentage presets. `+` / `-` and `Ctrl` / `Cmd` + mouse wheel adjust zoom too. Zoomed pages are rendered at a higher resolution on demand.
+
 These are review candidates, not definitive typesetting errors. PDF text extraction may lose spacing or paragraph structure; outlined, rasterized, or otherwise non-extractable lettering cannot be spell-checked. This version does not OCR artwork, call an AI service, validate color space, or parse `.indd` directly. Color-space validation is deferred until the print requirement is specified. The page image is rendered on demand, so the 300 ppi check uses the image's original dimensions and placed size rather than the preview resolution.
 
 The bundled Hunspell dictionaries come from the [LibreOffice dictionaries repository](https://github.com/LibreOffice/dictionaries); their license notices are in `assets/dictionaries/`. The EPUB renderer bundles epub.js 0.3.93 and JSZip 3.7.1.
