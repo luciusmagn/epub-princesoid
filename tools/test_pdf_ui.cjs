@@ -157,4 +157,19 @@ assert.ok(Number.parseFloat(elements.get("#pdf-stage").style.height) <= 658);
 run("setPdfZoom(100); setPdfZoom(-100);");
 assert.equal(run("pdfState.zoom"), 0.25);
 
-console.log("PDF UI geometry, review undo, allowed-word and zoom checks passed");
+context.spacingExcerpt = new Element();
+run('appendFindingExcerpt(spacingExcerpt, testSpacing);');
+assert.equal(context.spacingExcerpt.children[1].textContent, "··");
+context.punctuationExcerpt = new Element();
+run('appendFindingExcerpt(punctuationExcerpt, { category: "spacing", locator: "o,wo", excerpt: "Hello,world" });');
+assert.equal(context.punctuationExcerpt.children[1].textContent, "o,wo");
+
+context.joined = { id: 3, page: 1, category: "word-spacing", title: "Possible missing space: This is", excerpt: "Thisis text", locator: "Thisis", rect: null };
+run('pdfEls.filter.value = "all"; showPdfReport({ language: "en", findings: [...testReport.findings, joined] }); addAllowedWord("Thisis");');
+assert.equal(run("pdfState.visibleFindings.length"), 2);
+assert.equal(run('pdfState.allowedWords.has("thisis")'), true);
+run('undoReviewAction();');
+assert.equal(run("pdfState.visibleFindings.length"), 3);
+assert.equal(run("pdfState.activeFinding.id"), 3);
+
+console.log("PDF UI geometry, review undo, allowed-word, zoom and spacing checks passed");

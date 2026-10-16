@@ -23,15 +23,17 @@ On Linux, Wry uses WebKitGTK. On macOS it uses `WKWebView`; install the three PD
 ## PDF Checks
 
 - End-of-line word breaks against TeX patterns and Hunspell spelling.
-- Spelling, spaced hyphens used as dashes, Czech quotation marks, and double spaces.
+- Spelling, spaced hyphens used as dashes, Czech quotation marks, double spaces, and missing spaces at punctuation, with exclusions for numbers, URLs, code, and superscript footnote markers.
+- Possible joined words where Hunspell suggests adding a space without changing letters (for example, `thebook` to `the book`). Dictionary words, including accepted compounds, are left alone; technical terms can be added to allowed words.
 - Possible widows and orphans at page boundaries.
 - Contents page numbers against PDF page labels, bookmarks, and target headings.
 - Placed raster images below 300 effective ppi.
 - Paragraphs that appear to be in another language and pages with no extractable text.
 
-Select a finding to jump to and zoom in on its page; the arrow buttons step through the visible findings. Text findings use character positions for a precise marker when the PDF exposes them; double spaces are shown as dots in the finding excerpt. The `+` beside a spelling finding accepts that word globally. The `Words` button opens a searchable manager for adding and removing accepted words without taking space from the findings list. The `x` button ignores one finding for the current file. Both lists persist locally. The proofing language can be auto-detected or set to English, Czech, Spanish, or German. `Braiins`, `frontend`, and `backend` (including their plurals) are built-in accepted spellings. The EPUB view still includes its reader presets, margins, and debug page logs.
+Select a finding to jump to and zoom in on its page; the arrow buttons step through the visible findings. Text findings use character positions for a precise marker when the PDF exposes them; double spaces are shown as dots in the finding excerpt. The `+` beside a spelling or joined-word finding accepts that word globally. The `Words` button opens a searchable manager for adding and removing accepted words without taking space from the findings list. The `x` button ignores one finding for the current file. Both lists persist locally. The proofing language can be auto-detected or set to English, Czech, Spanish, or German. `Braiins`, `frontend`, and `backend` (including their plurals) are built-in accepted spellings. The EPUB view still includes its reader presets, margins, and debug page logs.
 
 Run `cargo test` and `node tools/test_pdf_ui.cjs` for the focused scanner and UI checks.
+With Hunspell installed, `cargo test dictionary_spacing_checks -- --ignored` also checks joined words and exclusions against all four bundled dictionaries.
 
 PDF highlights use a translucent fill without outlines. `Undo` reverses ignored findings and changes to allowed words in the current review session; `Ctrl+Z` / `Cmd+Z` also works outside text fields. The page toolbar has zoom buttons, Fit Page, Fit Width, and percentage presets. `+` / `-` and `Ctrl` / `Cmd` + mouse wheel adjust zoom too. Zoomed pages are rendered at a higher resolution on demand.
 

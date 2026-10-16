@@ -57,7 +57,7 @@ const PDF_CSS_SCALE = 96 / 72;
 const PDF_ZOOM_PRESETS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 const PDF_CATEGORIES = {
   coverage: "Text coverage", image: "Image", toc: "Contents", hyphenation: "Word break", dash: "Dash",
-  quote: "Quotes", spacing: "Spacing", spelling: "Spelling", language: "Language", widow: "Page break"
+  quote: "Quotes", spacing: "Spacing", "word-spacing": "Joined words", spelling: "Spelling", language: "Language", widow: "Page break"
 };
 
 try {
@@ -376,14 +376,15 @@ function addAllowedWord(value) {
   }
   pdfEls.wordInput.value = "";
   if (pdfState.payload?.accepted_defaults?.includes(word) || pdfState.allowedWords.has(word)) return;
-  const finding = pdfState.activeFinding?.category === "spelling" && pdfState.activeFinding.locator === word
-    ? pdfState.activeFinding : pdfState.report?.findings.find((item) => item.category === "spelling" && item.locator === word);
+  const matchesWord = (finding) => isWordFinding(finding) && finding.locator.toLowerCase() === word;
+  const finding = matchesWord(pdfState.activeFinding)
+    ? pdfState.activeFinding : pdfState.report?.findings.find(matchesWord);
   rememberReviewAction({ type: "word", word, wasAllowed: false, finding });
   pdfState.allowedWords.add(word);
   pdfEls.wordSearch.value = "";
   saveAllowedWords();
   renderAllowedWords();
-  if (pdfState.activeFinding?.category === "spelling" && pdfState.activeFinding.locator === word) clearFindingFocus();
+  if (matchesWord(pdfState.activeFinding)) clearFindingFocus();
   renderFindings();
   renderMarkers();
   if (!pdfEls.wordDialog.open) showToast(`${word} allowed.`);
@@ -456,9 +457,13 @@ function focusRestoredFinding(target) {
   if (row) selectFinding(finding, row);
 }
 
+function isWordFinding(finding) {
+  return Boolean(finding?.locator && (finding.category === "spelling" || finding.category === "word-spacing"));
+}
+
 function findingIsHidden(finding) {
   return pdfState.ignored.has(findingKey(finding)) ||
-    (finding.category === "spelling" && pdfState.allowedWords.has(finding.locator));
+    (isWordFinding(finding) && pdfState.allowedWords.has(finding.locator.toLowerCase()));
 }
 
 function readIgnored(path) {
@@ -492,7 +497,7 @@ function renderFindings() {
   }
   for (const finding of visible) {
     const row = document.createElement("div");
-    row.className = `pdf-issue${pdfState.activeFinding?.id === finding.id ? " active" : ""}${finding.category === "spelling" && finding.locator ? " has-allow" : ""}`;
+    row.className = `pdf-issue${pdfState.activeFinding?.id === finding.id ? " active" : ""}${isWordFinding(finding) ? " has-allow" : ""}`;
     row.dataset.findingId = String(finding.id);
     row.setAttribute("role", "listitem");
     row.tabIndex = 0;
@@ -510,7 +515,7 @@ function renderFindings() {
     const excerpt = document.createElement("span");
     excerpt.className = "pdf-issue-excerpt";
     appendFindingExcerpt(excerpt, finding);
-    if (finding.category === "spelling" && finding.locator) {
+    if (isWordFinding(finding)) {
       const allow = document.createElement("button");
       allow.className = "pdf-allow";
       allow.type = "button";
@@ -570,8 +575,9 @@ function appendFindingExcerpt(element, finding) {
   const index = target ? finding.excerpt.toLowerCase().indexOf(target.toLowerCase()) : -1;
   if (index < 0) { element.textContent = finding.excerpt; return; }
   const marker = document.createElement("mark");
-  marker.textContent = finding.category === "spacing" ? "·".repeat(target.length) : finding.excerpt.slice(index, index + target.length);
-  if (finding.category === "spacing") marker.title = `${target.length} spaces`;
+  const spaces = finding.category === "spacing" && /^ {2,}$/.test(target);
+  marker.textContent = spaces ? "·".repeat(target.length) : finding.excerpt.slice(index, index + target.length);
+  if (spaces) marker.title = `${target.length} spaces`;
   element.append(finding.excerpt.slice(0, index), marker, finding.excerpt.slice(index + target.length));
 }
 

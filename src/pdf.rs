@@ -663,6 +663,8 @@ pub fn scan(
             "dashes",
             "quotation marks",
             "double spaces",
+            "punctuation spacing",
+            "joined words",
             "spelling",
             "language",
             "widows and orphans",
@@ -854,6 +856,230 @@ fn internal_double_spaces(text: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+fn technical_text_ranges(text: &str) -> Vec<(usize, usize)> {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?ix)",
+            r"\b(?:https?://|ftp://|www\.|mailto:)[^\s<>]+",
+            r"|\b[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}.\-]+\.[\p{L}]{2,}\b",
+            r"|\b(?:[\p{L}\p{N}_\-]+\.)+(?:com|org|net|edu|gov|io|dev|app|cz|es|de|eu|uk|info|",
+            r"rs|json|pdf|epub|svg|md|txt|png|jpg|jpeg|toml|lock|py|js|ts|html|css|csv|zip|yaml|yml|cpp|hpp|h|c|tex|sh)\b",
+            r"|\b[\p{L}_][\p{L}\p{N}_]*(?:::[\p{L}_][\p{L}\p{N}_]*)+\b",
+            r"|(?:\b[\p{L}_][\p{L}\p{N}_]*)?\.[\p{L}_][\p{L}\p{N}_]*\([^()\s]*\)",
+            r"|\b[\p{L}_][\p{L}\p{N}_]*!\s*[\(\[\{]",
+            r"|&?\[[^\]\s]*\.\.[^\]\s]*\]",
+            r"|(?:\b[\p{L}\p{N}_.\-]+/)+[\p{L}\p{N}_.{}\-]+",
+            r"|(?:^|\s)[’'][\p{L}_][\p{L}\p{N}_]*\b",
+            r"|`[^`]*`",
+            r"|[;:][\-^]?[)(DPp/](?:\s|$)",
+        ))
+        .unwrap()
+    });
+    pattern
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+fn in_text_range(offset: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, end)| start <= offset && offset < end)
+}
+
+fn opening_punctuation(ch: char, language: &str) -> bool {
+    matches!(ch, '(' | '[' | '{' | '„' | '«' | '¿' | '¡') || ch == '“' && language == "en"
+}
+
+fn closing_punctuation(ch: char, language: &str) -> bool {
+    matches!(ch, ')' | ']' | '}' | '”' | '’' | '»') || ch == '“' && matches!(language, "cs" | "de")
+}
+
+fn missing_punctuation_spaces(
+    text: &str,
+    language: &str,
+    technical: &[(usize, usize)],
+) -> Vec<usize> {
+    static ABBREVIATION: OnceLock<Regex> = OnceLock::new();
+    let abbreviations: Vec<_> = ABBREVIATION
+        .get_or_init(|| Regex::new(r"(?:\p{L}\.){2,}\p{L}\b|(?:\p{L}\.){2,}").unwrap())
+        .find_iter(text)
+        .map(|m| (m.start(), m.end().saturating_sub(1)))
+        .collect();
+    let chars: Vec<_> = text.char_indices().collect();
+    let mut spaces = Vec::new();
+    let mut quoted = false;
+    for (index, &(offset, ch)) in chars.iter().enumerate() {
+        if ch == '"' && !in_text_range(offset, technical) {
+            quoted = !quoted;
+        }
+        if in_text_range(offset, technical) {
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|i| chars[i].1);
+        let next = chars.get(index + 1).map(|&(_, ch)| ch);
+        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '…') && index > 0 {
+            if in_text_range(offset, &abbreviations)
+                || previous.is_some_and(|c| c.is_numeric()) && next.is_some_and(|c| c.is_numeric())
+                || ch == '.' && previous.is_some_and(char::is_whitespace)
+            {
+                continue;
+            }
+            let mut end = index + 1;
+            let mut closing_quote = quoted;
+            while let Some(&(_, next)) = chars.get(end) {
+                if next == '"' && closing_quote {
+                    closing_quote = false;
+                } else if !closing_punctuation(next, language) {
+                    break;
+                }
+                end += 1;
+            }
+            if let Some(&(boundary, next)) = chars.get(end) {
+                if next.is_alphanumeric() || opening_punctuation(next, language) || next == '"' {
+                    spaces.push(boundary);
+                }
+            }
+        } else if (closing_punctuation(ch, language) || ch == '"' && !quoted)
+            && !(ch == '’'
+                && previous.is_some_and(char::is_alphabetic)
+                && next.is_some_and(char::is_alphabetic))
+        {
+            let optional_prefix = ch == ')'
+                && text[..offset]
+                    .rsplit_once('(')
+                    .is_some_and(|(before, inner)| {
+                        !before.ends_with(char::is_alphabetic)
+                            && (1..=2).contains(&inner.chars().count())
+                            && inner.chars().all(char::is_alphabetic)
+                    });
+            if next.is_some_and(char::is_alphanumeric) && !optional_prefix {
+                spaces.push(offset + ch.len_utf8());
+            }
+        } else if opening_punctuation(ch, language)
+            && previous.is_some_and(char::is_alphanumeric)
+            && next.is_some_and(char::is_alphabetic)
+            && !in_text_range(offset.saturating_sub(1), technical)
+        {
+            // Parenthesized inflections such as "reader(s)" do not need a space.
+            let suffix = &text[offset + ch.len_utf8()..];
+            let inflection = ch == '('
+                && suffix.find(')').is_some_and(|end| {
+                    let inner = &suffix[..end];
+                    (1..=2).contains(&inner.chars().count())
+                        && inner.chars().all(char::is_alphabetic)
+                });
+            if !inflection {
+                spaces.push(offset);
+            }
+        }
+    }
+    spaces.sort_unstable();
+    spaces.dedup();
+    spaces
+}
+
+fn joining_words(language: &str) -> &'static [&'static str] {
+    match language {
+        "cs" => &[
+            "a", "i", "k", "o", "s", "u", "v", "z", "to", "je", "se", "si", "na", "do", "od", "za",
+            "ze", "ve", "ke", "ne", "pro", "při", "před", "po", "bez", "toto", "tady", "ten", "ta",
+            "ty", "tak", "jak", "když", "že", "dobrý", "dobré",
+        ],
+        "de" => &[
+            "der", "die", "das", "den", "dem", "des", "ein", "eine", "ist", "es", "wir", "sie",
+            "du", "ich", "mit", "von", "zu", "auf", "an", "in", "für", "und", "oder", "nicht",
+            "hier", "dort", "hallo",
+        ],
+        "es" => &[
+            "a", "y", "o", "e", "u", "el", "la", "los", "las", "un", "una", "es", "son", "en",
+            "de", "del", "que", "por", "para", "con", "sin", "no", "esto", "este", "esta", "hola",
+            "buenos", "buenas",
+        ],
+        _ => &[
+            "a", "i", "the", "an", "this", "that", "these", "those", "is", "are", "was", "were",
+            "be", "to", "of", "for", "in", "on", "at", "by", "from", "with", "without", "and",
+            "or", "not", "it", "we", "you", "he", "she", "they", "there", "here", "hello",
+        ],
+    }
+}
+
+fn plausible_word_join(word: &str, suggestion: &str, language: &str, count: usize) -> bool {
+    let common = joining_words(language);
+    let parts: Vec<_> = suggestion
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    if parts
+        .iter()
+        .any(|part| part.chars().count() < 2 && !common.contains(&part.as_str()))
+    {
+        return false;
+    }
+    // Avoid splitting names, and repeated domain terms that already form document vocabulary.
+    if word.chars().next().is_some_and(char::is_uppercase)
+        && !parts
+            .first()
+            .is_some_and(|part| common.contains(&part.as_str()))
+    {
+        return false;
+    }
+    count <= 3 || parts.iter().any(|part| common.contains(&part.as_str()))
+}
+
+fn scan_punctuation_spacing(
+    line: &VisualLine,
+    page: usize,
+    language: &str,
+    technical: &[(usize, usize)],
+    findings: &mut Vec<Finding>,
+) {
+    for boundary in missing_punctuation_spaces(&line.text, language, technical) {
+        let number: String = line.text[boundary..]
+            .chars()
+            .take_while(|ch| ch.is_numeric())
+            .collect();
+        if !number.is_empty()
+            && line.runs.iter().any(|run| {
+                run.text.trim() == number
+                    && run.bbox.h < line.bbox.h * 0.75
+                    && run.bbox.y + run.bbox.h <= line.bbox.y + line.bbox.h * 0.8
+            })
+        {
+            continue;
+        }
+        let start = line.text[..boundary]
+            .char_indices()
+            .rev()
+            .nth(1)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let end = line.text[boundary..]
+            .char_indices()
+            .nth(2)
+            .map(|(index, _)| boundary + index)
+            .unwrap_or(line.text.len());
+        let target = &line.text[start..end];
+        let corrected = format!(
+            "{} {}",
+            &line.text[start..boundary],
+            &line.text[boundary..end]
+        );
+        add(
+            findings,
+            page,
+            "spacing",
+            "review",
+            "Missing space at punctuation",
+            format!("Check the missing word separator: {target} → {corrected}"),
+            excerpt_around(&line.text, start, end),
+            Some(approximate_text_box(line.bbox, &line.text, start, end)),
+        )
+        .locator = Some(target.to_owned());
+    }
+}
+
 fn scan_images(path: &Path, findings: &mut Vec<Finding>) -> Result<()> {
     let output = Command::new("pdfimages")
         .arg("-list")
@@ -1029,6 +1255,7 @@ fn scan_prose(
     let word_pattern = Regex::new(r"\p{L}{3,}").unwrap();
     let accepted = normalized_accepted_words(accepted_words);
     let mut word_positions: BTreeMap<String, Vec<(usize, TextBox, String)>> = BTreeMap::new();
+    let mut joined_positions: BTreeMap<String, Vec<(usize, TextBox, String)>> = BTreeMap::new();
     let mut pending_hyphens = Vec::new();
     for (index, page) in pages.iter().enumerate() {
         let height = meta.sizes[index].height;
@@ -1052,12 +1279,11 @@ fn scan_prose(
                     .locator = Some(run.text[start..end].to_owned());
                 }
             }
+            let technical = technical_text_ranges(&line.text);
+            scan_punctuation_spacing(line, index + 1, language, &technical, findings);
             scan_marks(line, index + 1, language, findings);
             for match_ in word_pattern.find_iter(&line.text) {
                 let word = match_.as_str();
-                if word.len() < 4 || word.chars().next().is_some_and(char::is_uppercase) {
-                    continue;
-                }
                 if accepted_word(word) || accepted.contains(&word.to_lowercase()) {
                     continue;
                 }
@@ -1075,6 +1301,19 @@ fn scan_prose(
                 }
                 if match_.start() > 0 && line.text[..match_.start()].ends_with(['/', '@', '#', '_'])
                 {
+                    continue;
+                }
+                if (4..=64).contains(&word.chars().count())
+                    && !word.chars().skip(1).any(char::is_uppercase)
+                    && !in_text_range(match_.start(), &technical)
+                {
+                    joined_positions.entry(word.to_owned()).or_default().push((
+                        index + 1,
+                        approximate_text_box(line.bbox, &line.text, match_.start(), match_.end()),
+                        excerpt_around(&line.text, match_.start(), match_.end()),
+                    ));
+                }
+                if word.len() < 4 || word.chars().next().is_some_and(char::is_uppercase) {
                     continue;
                 }
                 word_positions
@@ -1126,16 +1365,50 @@ fn scan_prose(
     let spell_words: HashSet<String> = word_positions
         .keys()
         .cloned()
+        .chain(joined_positions.keys().cloned())
         .chain(pending_hyphens.iter().map(|(word, _)| word.to_lowercase()))
         .collect();
     let misspelled = hunspell_misspellings(language, spell_words.iter())?;
+    let unknown_joined: Vec<_> = joined_positions
+        .keys()
+        .filter(|word| misspelled.contains(*word))
+        .filter(|word| {
+            let lowercase = word.to_lowercase();
+            !word.chars().next().is_some_and(char::is_uppercase)
+                || joining_words(language)
+                    .iter()
+                    .any(|prefix| lowercase.starts_with(prefix))
+        })
+        .cloned()
+        .collect();
+    let suggestions = hunspell_space_suggestions(language, unknown_joined.iter())?;
+    let mut joined_words = HashSet::new();
+    for (word, suggested) in suggestions {
+        let locations = &joined_positions[&word];
+        if !plausible_word_join(&word, &suggested, language, locations.len()) {
+            continue;
+        }
+        let (page, bbox, context) = &locations[0];
+        joined_words.insert(word.to_lowercase());
+        add(
+            findings,
+            *page,
+            "word-spacing",
+            "review",
+            format!("Possible missing space: {suggested}"),
+            format!("The {} dictionary suggests inserting a space without changing the letters. Found {} time(s); a name or technical term may be intentional.", language_name(language), locations.len()),
+            context,
+            Some(*bbox),
+        )
+        .locator = Some(word);
+    }
     for (word, finding) in pending_hyphens {
         if !misspelled.contains(&word.to_lowercase()) || accepted.contains(&word.to_lowercase()) {
             findings.push(finding);
         }
     }
     for (word, locations) in word_positions {
-        if !misspelled.contains(&word) || locations.len() > 3 {
+        if !misspelled.contains(&word) || locations.len() > 3 || joined_words.contains(&word) {
             continue;
         }
         let (page, bbox, context) = &locations[0];
@@ -1378,6 +1651,55 @@ fn hunspell_misspellings<'a>(
     language: &str,
     words: impl Iterator<Item = &'a String>,
 ) -> Result<HashSet<String>> {
+    let output = hunspell_output(language, "-l", words)?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn hunspell_space_suggestions<'a>(
+    language: &str,
+    words: impl Iterator<Item = &'a String>,
+) -> Result<BTreeMap<String, String>> {
+    let output = hunspell_output(language, "-a", words)?;
+    Ok(parse_space_suggestions(&output))
+}
+
+fn parse_space_suggestions(output: &str) -> BTreeMap<String, String> {
+    let mut suggestions = BTreeMap::new();
+    for line in output.lines() {
+        let Some((head, choices)) = line.strip_prefix("& ").and_then(|s| s.split_once(": ")) else {
+            continue;
+        };
+        let Some(word) = head.split_whitespace().next() else {
+            continue;
+        };
+        for choice in choices.split(", ") {
+            let parts: Vec<_> = choice.split_whitespace().collect();
+            if parts.len() >= 2
+                && parts.iter().all(|s| s.chars().all(char::is_alphabetic))
+                && parts.concat().to_lowercase() == word.to_lowercase()
+            {
+                suggestions.insert(word.to_owned(), choice.to_owned());
+                break;
+            }
+        }
+    }
+    suggestions
+}
+
+fn hunspell_output<'a>(
+    language: &str,
+    mode: &str,
+    words: impl Iterator<Item = &'a String>,
+) -> Result<String> {
+    let words: Vec<_> = words.cloned().collect();
+    if words.is_empty() {
+        return Ok(String::new());
+    }
     let prefix = match language {
         "cs" => "cs_CZ",
         "es" => "es_ES",
@@ -1386,7 +1708,7 @@ fn hunspell_misspellings<'a>(
     };
     let path = dictionary_dir()?.join(prefix);
     let mut child = Command::new("hunspell")
-        .arg("-l")
+        .args([mode, "-i", "UTF-8"])
         .arg("-d")
         .arg(path)
         .stdin(Stdio::piped())
@@ -1394,28 +1716,29 @@ fn hunspell_misspellings<'a>(
         .stderr(Stdio::piped())
         .spawn()
         .context("hunspell is required for spelling checks")?;
-    {
-        let mut input = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("hunspell stdin unavailable"))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("hunspell stdin unavailable"))?;
+    let protocol = mode == "-a";
+    // Drain output while feeding input, so large books cannot fill both pipes.
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
         for word in words {
-            writeln!(input, "{word}")?;
+            writeln!(input, "{}{word}", if protocol { "^" } else { "" })?;
         }
-    }
-    let output = child.wait_with_output()?;
+        Ok(())
+    });
+    let output = child.wait_with_output();
+    let written = writer.join();
+    let output = output?;
     if !output.status.success() {
         return Err(anyhow!(
             "spell checker failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect())
+    written.map_err(|_| anyhow!("spell checker input thread failed"))??;
+    String::from_utf8(output.stdout).context("spell checker output is not UTF-8")
 }
 
 fn language_name(code: &str) -> &'static str {
@@ -1501,6 +1824,221 @@ mod tests {
         assert_eq!(internal_double_spaces("a  b  c  "), vec![(1, 3), (4, 6)]);
         assert!(internal_double_spaces("  a ").is_empty());
         assert_eq!(internal_double_spaces("a   b"), vec![(1, 4)]);
+    }
+
+    #[test]
+    fn finds_missing_spaces_at_punctuation_in_all_languages() {
+        for (text, language, expected) in [
+            ("Hello,world", "en", vec!["Hello, world"]),
+            ("End.Next", "en", vec!["End. Next"]),
+            ("One;two", "en", vec!["One; two"]),
+            ("Why?Yes!Now", "en", vec!["Why? Yes!Now", "Why?Yes! Now"]),
+            (
+                "Řekl:„Ahoj.“Potom odešel.",
+                "cs",
+                vec!["Řekl: „Ahoj.“Potom odešel.", "Řekl:„Ahoj.“ Potom odešel."],
+            ),
+            ("Hola,¿qué tal?", "es", vec!["Hola, ¿qué tal?"]),
+            ("Ende.Danach", "de", vec!["Ende. Danach"]),
+            (
+                "word(note)next",
+                "en",
+                vec!["word (note)next", "word(note) next"],
+            ),
+            ("“Hello.”Next", "en", vec!["“Hello.” Next"]),
+            (
+                "He said,\"hello\"next.",
+                "en",
+                vec!["He said, \"hello\"next.", "He said,\"hello\" next."],
+            ),
+        ] {
+            let offsets = missing_punctuation_spaces(text, language, &technical_text_ranges(text));
+            let corrected: Vec<_> = offsets
+                .iter()
+                .map(|&at| format!("{} {}", &text[..at], &text[at..]))
+                .collect();
+            assert_eq!(corrected, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn punctuation_spacing_preserves_numbers_abbreviations_and_technical_text() {
+        for text in [
+            "Normal, spaced. Text: here; yes! Really? Yes.",
+            "12:30 1,234.56 1,25 127.0.0.1 v1.2.3 3.5mm",
+            "e.g. i.e. U.S.A. s.r.o. reader(s)",
+            "a.k.a Erin Ph.D. next",
+            "Let’s don’t world’s you’ve John’s",
+            "Citation[12] Note(3)",
+            "The printf() function and helper(x). My favorite:(",
+            "The println!() macro. And .map(invert), op.as_str() and (de)serialization.",
+            "Borrowing with ’d and 'static lifetimes.",
+            "The &[from..to] operator and src/bin/{name}.rs path.",
+            "Wrong closing quote: “verify“. Next",
+            "https://example.org/a,b?q=test www.example.com name@example.org",
+            "example.cz export.pdf chapter.epub main.rs package.json",
+            "std::io::Read `word,word` `thebook`",
+            "Comma,\u{00a0}space.\u{202f}Next",
+        ] {
+            assert!(
+                missing_punctuation_spaces(text, "en", &technical_text_ranges(text)).is_empty(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn spacing_distinguishes_superscript_footnotes_from_normal_numbers() {
+        let bbox = TextBox {
+            x: 50.0,
+            y: 80.0,
+            w: 70.0,
+            h: 10.0,
+        };
+        let mut line = VisualLine {
+            text: "Text:12".into(),
+            bbox,
+            code: false,
+            runs: vec![
+                Run {
+                    text: "Text:".into(),
+                    bbox,
+                },
+                Run {
+                    text: "12".into(),
+                    bbox: TextBox {
+                        x: 112.0,
+                        y: 80.0,
+                        w: 8.0,
+                        h: 4.0,
+                    },
+                },
+            ],
+        };
+        let mut findings = Vec::new();
+        scan_punctuation_spacing(&line, 1, "en", &[], &mut findings);
+        assert!(findings.is_empty());
+        line.runs = vec![Run {
+            text: line.text.clone(),
+            bbox,
+        }];
+        scan_punctuation_spacing(&line, 1, "en", &[], &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].locator.as_deref(), Some("t:12"));
+    }
+
+    #[test]
+    fn joined_word_suggestions_must_only_insert_spaces() {
+        let suggestions = parse_space_suggestions(concat!(
+            "@(#) International Ispell Version\n",
+            "& thebook 3 1: notebook, the-book, the book\n\n",
+            "& Thisis 2 1: Thesis, This is\n\n",
+            "& dobrýden 1 1: dobrý den\n\n",
+            "& typo 1 1: type word\n\n",
+            "& valid 1 1: valid-word\n\n",
+            "*\n\n",
+        ));
+        assert_eq!(
+            suggestions.get("thebook").map(String::as_str),
+            Some("the book")
+        );
+        assert_eq!(
+            suggestions.get("Thisis").map(String::as_str),
+            Some("This is")
+        );
+        assert_eq!(
+            suggestions.get("dobrýden").map(String::as_str),
+            Some("dobrý den")
+        );
+        assert!(!suggestions.contains_key("typo"));
+        assert!(!suggestions.contains_key("valid"));
+        assert!(!plausible_word_join("Daniela", "Daniel a", "en", 1));
+        assert!(!plausible_word_join("crypto", "crypt o", "en", 1));
+        assert!(!plausible_word_join("toolchain", "tool chain", "en", 8));
+        assert!(plausible_word_join("thebook", "the book", "en", 8));
+        assert!(plausible_word_join("Thisis", "This is", "en", 1));
+    }
+
+    fn prose_findings(
+        text: &str,
+        language: &'static str,
+        code: bool,
+        accepted: &[String],
+    ) -> Vec<Finding> {
+        let bbox = TextBox {
+            x: 50.0,
+            y: 80.0,
+            w: 400.0,
+            h: 10.0,
+        };
+        let line = VisualLine {
+            text: text.into(),
+            bbox,
+            runs: vec![Run {
+                text: text.into(),
+                bbox,
+            }],
+            code,
+        };
+        let pages = vec![PageText {
+            lines: vec![line],
+            blocks: vec![],
+        }];
+        let meta = PdfMeta {
+            page_count: 1,
+            labels: vec!["1".into()],
+            sizes: vec![PageSize {
+                width: 612.0,
+                height: 792.0,
+            }],
+            outline: vec![],
+        };
+        let mut findings = Vec::new();
+        scan_prose(
+            &pages,
+            &meta,
+            language,
+            &HashSet::new(),
+            accepted,
+            &mut findings,
+        )
+        .unwrap();
+        findings
+    }
+
+    #[test]
+    #[ignore = "requires the Hunspell executable"]
+    fn dictionary_spacing_checks() {
+        for (language, word, split) in [
+            ("en", "thebook", "the book"),
+            ("cs", "dobrýden", "dobrý den"),
+            ("es", "unlibro", "un libro"),
+            ("de", "Dasist", "Das ist"),
+        ] {
+            let findings = prose_findings(word, language, false, &[]);
+            assert!(
+                findings.iter().any(|f| f.category == "word-spacing"
+                    && f.title.contains(split)
+                    && f.locator.as_deref() == Some(word)),
+                "{language}: {findings:?}"
+            );
+            assert!(
+                !findings.iter().any(|f| f.category == "spelling"),
+                "duplicate finding for {word}"
+            );
+            let accepted = prose_findings(word, language, false, &[word.to_lowercase()]);
+            assert!(!accepted.iter().any(|f| f.category == "word-spacing"));
+        }
+        assert!(prose_findings("Haustürschlüssel", "de", false, &[])
+            .iter()
+            .all(|f| f.category != "word-spacing"));
+        assert!(prose_findings("thebook,word", "en", true, &[]).is_empty());
+        let findings = prose_findings("Text.Next thebook.", "en", false, &[]);
+        assert!(findings
+            .iter()
+            .any(|f| f.category == "spacing"
+                && f.locator.as_deref().is_some_and(|s| s.contains('.'))));
+        assert!(findings.iter().any(|f| f.category == "word-spacing"));
     }
 
     #[test]
